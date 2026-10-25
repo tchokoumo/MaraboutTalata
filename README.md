@@ -12,6 +12,12 @@ MaraboutTalata est une application de bureau de supervision système locale, con
 
 Les commandes de processus affichées sont limitées à 2 048 caractères et certains formats courants de secrets sont masqués. Ce masquage est heuristique et ne garantit pas la détection de toutes les données sensibles.
 
+### Confidentialité des arguments de processus
+
+Pour les processus candidats Codex CLI et Claude Code, les détails renvoyés par `get_process_command` ne contiennent que le nom du processus et l’indicateur de masquage. Les snapshots et les preuves de détection n’incluent pas leurs arguments, et le code de l’application ne les écrit pas dans les journaux. Sous Linux, le détecteur lit au plus les deux premiers arguments, dans une limite totale de 8 194 octets ; un argument incomplet ou tronqué n’est pas utilisé comme preuve, et le tampon temporaire est effacé après lecture.
+
+Limite : `sysinfo::System` conserve les arguments bruts dans ses structures internes en mémoire, car le moniteur collecte aussi les lignes de commande des autres processus. Le cache applicatif ne conserve qu’une commande masquée pour les candidats agents ; leur empreinte de cache n’inclut pas les arguments. Les commandes des autres processus sont masquées par heuristiques et peuvent encore contenir des valeurs sensibles inconnues.
+
 ## Développement
 
 Prérequis : Node.js et npm, Rust avec Cargo, ainsi que les dépendances système nécessaires à Tauri 2 sur la plateforme cible.

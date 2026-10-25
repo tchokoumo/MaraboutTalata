@@ -2,10 +2,11 @@
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import AppIcon from "./components/AppIcon.vue";
+import AgentWatcherPage from "./components/AgentWatcherPage.vue";
 import ProcessTable from "./components/ProcessTable.vue";
 import type { DiskInfo, ProcessCommand, ProcessInfo, ProcessSortKey, SortDirection, SystemSnapshot } from "./types/monitor";
 
-type View = "overview" | "processes" | "storage";
+type View = "overview" | "processes" | "storage" | "agents";
 type Theme = "dark" | "light";
 type MetricKey = "cpu" | "memory" | "swap" | "storage";
 interface HistoryPoint {
@@ -97,6 +98,7 @@ const viewTitle = computed(() => ({
   overview: "Vue d’ensemble",
   processes: "Processus",
   storage: "Stockage",
+  agents: "Agents IA",
 })[activeView.value]);
 
 const updateTime = computed(() => snapshot.value
@@ -302,6 +304,12 @@ onUnmounted(() => {
           <span>Processus</span>
           <span class="nav-count">{{ snapshot?.processes.length ?? "—" }}</span>
         </button>
+        <button class="nav-item" :class="{ active: activeView === 'agents' }" @click="activeView = 'agents'">
+          <AppIcon name="terminal" />
+          <span>Agents IA</span>
+          <span class="nav-count">{{ snapshot?.agents.sessions.length ?? "—" }}</span>
+          <span v-if="activeView === 'agents'" class="active-mark" />
+        </button>
         <button class="nav-item" :class="{ active: activeView === 'storage' }" @click="activeView = 'storage'">
           <AppIcon name="storage" />
           <span>Stockage</span>
@@ -359,7 +367,8 @@ onUnmounted(() => {
             <p class="page-subtitle">
               <template v-if="activeView === 'overview'">Les performances de votre machine, en temps réel.</template>
               <template v-else-if="activeView === 'processes'">Consultez et explorez les processus actifs.</template>
-              <template v-else>Volumes montés et espace disponible sur vos disques.</template>
+              <template v-else-if="activeView === 'storage'">Volumes montés et espace disponible sur vos disques.</template>
+              <template v-else>Détection locale et analyse des processus Codex CLI et Claude Code.</template>
             </p>
           </div>
           <div class="heading-controls">
@@ -480,7 +489,7 @@ onUnmounted(() => {
             </section>
           </template>
 
-          <template v-else>
+          <template v-else-if="activeView === 'storage'">
             <section class="storage-summary-grid">
               <article class="panel storage-summary"><div class="metric-icon accent-icon-green"><AppIcon name="drive" :size="18" /></div><div><span class="footer-label">VOLUMES AFFICHÉS</span><strong>{{ displayDisks.length }}</strong></div></article>
               <article class="panel storage-summary"><div class="metric-icon accent-icon-cyan"><AppIcon name="memory" :size="18" /></div><div><span class="footer-label">VOLUME PRINCIPAL</span><strong>{{ rootDisk?.mountPoint ?? 'Indisponible' }}</strong></div></article>
@@ -504,6 +513,10 @@ onUnmounted(() => {
                 </table>
               </div>
             </section>
+          </template>
+
+          <template v-else>
+            <AgentWatcherPage :watcher="snapshot.agents" />
           </template>
         </template>
 
