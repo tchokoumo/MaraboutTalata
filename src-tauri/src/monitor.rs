@@ -7,6 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
+use crate::agent_watcher::{
+    self, AgentWatchConfig, AgentWatchSnapshot, AgentWatcher, ProcessSample,
+};
+
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
@@ -24,6 +28,7 @@ pub struct SystemSnapshot {
     swap: SwapInfo,
     disks: Vec<DiskInfo>,
     processes: Vec<ProcessInfo>,
+    agents: AgentWatchSnapshot,
     system: SystemInfo,
 }
 
@@ -80,6 +85,7 @@ struct ProcessInfo {
     cpu_percent: f32,
     memory_bytes: u64,
     run_time_seconds: u64,
+    start_time_seconds: u64,
 }
 
 #[derive(Serialize)]
@@ -108,6 +114,7 @@ struct Monitor {
     disk_info_cache: Vec<DiskInfo>,
     users: Users,
     process_metadata: HashMap<usize, CachedProcessMetadata>,
+    agent_watcher: AgentWatcher,
     last_disk_refresh: Instant,
 }
 
@@ -135,6 +142,7 @@ impl MonitorState {
                 disk_info_cache,
                 users: Users::new_with_refreshed_list(),
                 process_metadata: HashMap::new(),
+                agent_watcher: AgentWatcher::new(),
                 last_disk_refresh: Instant::now(),
             }),
         }
@@ -164,6 +172,7 @@ impl MonitorState {
             disk_info_cache,
             users,
             process_metadata,
+            agent_watcher,
             ..
         } = &mut *monitor;
         let now = SystemTime::now()
@@ -201,18 +210,23 @@ impl MonitorState {
         let processes = {
             let metadata_cache = process_metadata;
             let mut processes = Vec::with_capacity(system.processes().len());
+            let mut agent_processes = Vec::with_capacity(system.processes().len());
 
             for (pid, process) in system.processes() {
                 let pid = pid.as_u32() as usize;
                 live_processes.insert(pid);
-                let signature = process_signature(process);
+                let name = process.name().to_string_lossy().into_owned();
+                let argv_hint = agent_watcher::candidate_hint(
+                    &name,
+                    process.exe(),
+                    process.cmd().iter().map(|part| part.as_os_str()),
+                );
+                let signature = process_signature(process, argv_hint);
 
                 if !metadata_cache
                     .get(&pid)
                     .is_some_and(|metadata| metadata.signature == signature)
                 {
-                    let name = process.name().to_string_lossy().into_owned();
-                    let (command, command_redacted) = process_command(process, &name);
                     let user = process
                         .user_id()
                         .map(|user_id| {
@@ -225,19 +239,23 @@ impl MonitorState {
 
                     metadata_cache.insert(
                         pid,
-                        CachedProcessMetadata {
-                            signature,
-                            name,
-                            user,
-                            command,
-                            command_redacted,
-                        },
+                        cached_process_metadata(signature, name, user, process.cmd(), argv_hint),
                     );
                 }
 
                 let metadata = metadata_cache
                     .get(&pid)
                     .expect("process metadata is populated before use");
+                agent_processes.push(ProcessSample {
+                    pid,
+                    parent_pid: process.parent().map(|parent| parent.as_u32() as usize),
+                    name: metadata.name.clone(),
+                    cpu_percent: percentage(process.cpu_usage()),
+                    memory_bytes: process.memory(),
+                    run_time_seconds: process.run_time(),
+                    start_time_seconds: process.start_time(),
+                    candidate_hint: argv_hint,
+                });
                 processes.push(ProcessInfo {
                     pid,
                     parent_pid: process.parent().map(|parent| parent.as_u32() as usize),
@@ -246,12 +264,15 @@ impl MonitorState {
                     cpu_percent: percentage(process.cpu_usage()),
                     memory_bytes: process.memory(),
                     run_time_seconds: process.run_time(),
+                    start_time_seconds: process.start_time(),
                 });
             }
 
             metadata_cache.retain(|pid, _| live_processes.contains(pid));
-            processes
+            let agent_snapshot = agent_watcher.sample(&agent_processes, now as u64);
+            (processes, agent_snapshot)
         };
+        let (processes, agents) = processes;
 
         let distribution = System::long_os_version()
             .or_else(System::name)
@@ -264,6 +285,7 @@ impl MonitorState {
             swap,
             disks,
             processes,
+            agents,
             system: SystemInfo {
                 distribution,
                 distribution_id: System::distribution_id(),
@@ -284,6 +306,16 @@ impl MonitorState {
                 command: metadata.command.clone(),
                 redacted: metadata.command_redacted,
             }))
+    }
+
+    pub fn set_agent_watch_config(
+        &self,
+        config: AgentWatchConfig,
+    ) -> Result<AgentWatchConfig, String> {
+        let mut monitor = self.monitor.lock().map_err(|_| {
+            "Le moniteur système est indisponible après une erreur interne.".to_owned()
+        })?;
+        monitor.agent_watcher.set_config(config)
     }
 }
 
@@ -359,27 +391,57 @@ fn free_space_bytes(_mount_point: &Path) -> Option<u64> {
     None
 }
 
-fn process_signature(process: &sysinfo::Process) -> u64 {
+fn process_signature(process: &sysinfo::Process, agent_candidate: bool) -> u64 {
     let mut hasher = DefaultHasher::new();
     process.start_time().hash(&mut hasher);
     process.name().hash(&mut hasher);
     process.exe().hash(&mut hasher);
     process.user_id().hash(&mut hasher);
-    process.cmd().hash(&mut hasher);
+    agent_candidate.hash(&mut hasher);
+    if !agent_candidate {
+        process.cmd().hash(&mut hasher);
+    }
     hasher.finish()
 }
 
-fn process_command(process: &sysinfo::Process, process_name: &str) -> (String, bool) {
-    if process.cmd().is_empty() {
+fn process_command(
+    args: &[std::ffi::OsString],
+    process_name: &str,
+    agent_candidate: bool,
+) -> (String, bool) {
+    if agent_candidate {
+        return redact_agent_command(args, process_name);
+    }
+    if args.is_empty() {
         return (process_name.to_owned(), false);
     }
 
-    let args = process
-        .cmd()
+    let args = args
         .iter()
         .map(|part| part.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     sanitize_command_args(&args, process_name)
+}
+
+fn cached_process_metadata(
+    signature: u64,
+    name: String,
+    user: String,
+    args: &[std::ffi::OsString],
+    agent_candidate: bool,
+) -> CachedProcessMetadata {
+    let (command, command_redacted) = process_command(args, &name, agent_candidate);
+    CachedProcessMetadata {
+        signature,
+        name,
+        user,
+        command,
+        command_redacted,
+    }
+}
+
+fn redact_agent_command(args: &[std::ffi::OsString], process_name: &str) -> (String, bool) {
+    (process_name.to_owned(), !args.is_empty())
 }
 
 fn sanitize_command_args(args: &[String], process_name: &str) -> (String, bool) {
@@ -599,7 +661,12 @@ fn truncate_chars(value: String, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MonitorState, is_technical_mount, sanitize_command_args, truncate_chars};
+    use super::{
+        MonitorState, cached_process_metadata, is_technical_mount, redact_agent_command,
+        sanitize_command_args, truncate_chars,
+    };
+    use crate::agent_watcher;
+    use std::ffi::OsString;
 
     #[test]
     fn classifies_virtual_and_docker_overlay_mounts_as_technical() {
@@ -662,6 +729,71 @@ mod tests {
         assert!(!command.contains("access-token-value"));
         assert!(!command.contains("query-secret"));
         assert!(!command.contains("cookie-secret"));
+    }
+
+    #[test]
+    fn hides_all_arguments_for_agent_process_candidates() {
+        let args = [
+            OsString::from("claude"),
+            OsString::from("--prompt"),
+            OsString::from("private conversation text"),
+        ];
+
+        let (command, redacted) = redact_agent_command(&args, "claude");
+
+        assert_eq!(command, "claude");
+        assert!(redacted);
+        assert!(!command.contains("private conversation text"));
+    }
+
+    #[test]
+    fn agent_arguments_stay_private_through_cache_api_and_frontend_snapshot() {
+        let monitor = MonitorState::new();
+        let pid = std::process::id() as usize;
+        let secret = "T002_PRIVATE_PROMPT_CONTENT_7b81";
+        let args = [
+            OsString::from("claude"),
+            OsString::from("--prompt"),
+            OsString::from(secret),
+        ];
+        let candidate =
+            agent_watcher::candidate_hint("claude", None, args.iter().map(OsString::as_os_str));
+        assert!(candidate);
+
+        monitor
+            .monitor
+            .lock()
+            .expect("monitor lock should be available")
+            .process_metadata
+            .insert(
+                pid,
+                cached_process_metadata(
+                    1,
+                    "claude".to_owned(),
+                    "test-user".to_owned(),
+                    &args,
+                    candidate,
+                ),
+            );
+
+        let detail = monitor
+            .process_command(pid)
+            .expect("Tauri process-command route should succeed")
+            .expect("cached process details should exist");
+        assert_eq!(detail.command, "claude");
+        assert!(detail.redacted);
+        let detail_json =
+            serde_json::to_string(&detail).expect("detail should serialize for Tauri");
+        assert!(!detail_json.contains(secret));
+
+        let snapshot = monitor
+            .snapshot()
+            .expect("snapshot collection should succeed");
+        let snapshot_json =
+            serde_json::to_string(&snapshot).expect("snapshot should serialize for Tauri");
+        assert!(!snapshot_json.contains(secret));
+        assert!(snapshot_json.contains("\"agents\""));
+        assert!(!snapshot_json.contains("\"command\""));
     }
 
     #[test]
